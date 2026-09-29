@@ -1,0 +1,38 @@
+{
+  "name": "pi-cron-bg",
+  "version": "0.1.0",
+  "description": "Cron and background jobs for Pi — non-blocking timed wakeups and a persistent recurring scheduler",
+  "license": "MIT",
+  "author": "Riccardo (BravoRicDev)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BravoRicDev/pi-cron-bg.git"
+  },
+  "homepage": "https://github.com/BravoRicDev/pi-cron-bg#readme",
+  "bugs": {
+    "url": "https://github.com/BravoRicDev/pi-cron-bg/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "cron",
+    "scheduler",
+    "background-tasks",
+    "wakeup",
+    "timer"
+  ],
+  "type": "module",
+  "files": [
+    "index.ts",
+    "harness.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node harness.mjs",
+    "typecheck": "tsc -p tsconfig.check.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

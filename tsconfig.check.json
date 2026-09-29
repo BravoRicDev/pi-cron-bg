@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "lib": ["ES2022", "dom"],
+    "types": ["node"],
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["/home/riccardo/.hermes/node/lib/node_modules/@earendil-works/pi-coding-agent"],
+      "typebox": ["/home/riccardo/.hermes/node/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox"]
+    }
+  },
+  "include": ["index.ts"]
+}
