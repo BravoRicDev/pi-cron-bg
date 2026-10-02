@@ -15,6 +15,19 @@ const BG_REQUEST_SCHEMA = 'pi-background-tasks.extension-request.v1';
 const SHARED_TIMERS_DIR = path.join(os.homedir(), '.pi', 'timers');
 const SHARED_TIMERS_FILE = path.join(SHARED_TIMERS_DIR, 'active-timers.json');
 const RECURRING_JOBS_FILE = path.join(SHARED_TIMERS_DIR, 'recurring-jobs.json');
+// User config: ~/.pi/cron-bg/config.json. When absent we fall back to the
+// defaults bundled in the extension, so a missing file is not an error.
+const CRON_BG_CONFIG_PATH = path.join(os.homedir(), '.pi', 'cron-bg', 'config.json');
+const CRON_BG_LOG_PATH = path.join(SHARED_TIMERS_DIR, 'cron-bg.log');
+/**
+ * The decision log is capped: a long-lived extension must not grow a file
+ * without bound. Past the cap the tail is kept, because the newest lines are the
+ * ones that explain the present.
+ */
+const LOG_MAX_BYTES = 256 * 1024;
+const LOG_KEEP_LINES = 2000;
+/** Grace before a one-shot timer past its deadline is considered dead. */
+const TIMER_GRACE_MS = 2000;
 
 interface SharedTimerEntry {
   id: string;
@@ -44,6 +57,18 @@ interface RecurringJob {
    */
   ownerSessionId?: string;
   /**
+   * Pid of the process that owned the session when the job was created or last
+   * adopted. `ownerSessionId` alone cannot tell a job of a LIVE session (whose
+   * heartbeat must never be stolen) from one whose session is GONE: the id is
+   * stable across `/resume`, so a resumed session matches by id, but a session
+   * started with `/new` or `/fork` sees only an id it does not recognise and
+   * therefore never touches the job. With the pid, a job whose owning process
+   * is dead is ADOPTED by the session that finds it, instead of staying armed
+   * forever against a task id that died with its process.
+   * Absent on files written by older versions: those are left alone.
+   */
+  ownerPid?: number;
+  /**
    * Consecutive failed scheduling attempts. Bounded so a job cannot spin
    * forever when the background-task backend is unavailable: at the cap the
    * job is deactivated instead of retried, and the count resets on success.
@@ -59,6 +84,64 @@ function ensureTimersDir() {
       fs.mkdirSync(SHARED_TIMERS_DIR, { recursive: true });
     } catch {}
   }
+}
+
+interface CronBgConfig {
+  /** Render the timer widget and the status line. */
+  showWidget: boolean;
+  /** Append a diagnostic line to ~/.pi/timers/cron-bg.log. */
+  debug: boolean;
+}
+
+const DEFAULT_CONFIG: CronBgConfig = { showWidget: true, debug: false };
+
+/**
+ * The README documents `~/.pi/cron-bg/config.json` with {showWidget, debug},
+ * but nothing ever read it: the two switches below were hardwired. The file is
+ * read once, with every value validated, so a typo degrades to the default
+ * instead of leaving the widget in an undefined state.
+ */
+function loadConfig(): CronBgConfig {
+  try {
+    const raw = fs.readFileSync(CRON_BG_CONFIG_PATH, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<CronBgConfig>;
+    return {
+      showWidget: typeof parsed.showWidget === 'boolean' ? parsed.showWidget : DEFAULT_CONFIG.showWidget,
+      debug: typeof parsed.debug === 'boolean' ? parsed.debug : DEFAULT_CONFIG.debug,
+    };
+  } catch {
+    // Missing or unreadable config: the defaults are a working configuration,
+    // not a degraded one.
+    return { ...DEFAULT_CONFIG };
+  }
+}
+
+/** Diagnostic log, silent unless config.debug is on. */
+function debugLog(cfg: CronBgConfig, msg: string): void {
+  if (!cfg.debug) return;
+  appendLog(msg);
+}
+
+/**
+ * A DECISION is always written, debug or not: re-arming a job, dropping a stale
+ * task id, skipping a job and why. A scheduling decision that leaves no trace is
+ * undebuggable — "the jobs stopped firing" could only be diagnosed from the
+ * outside, by reading state files and process tables, and that is exactly why
+ * that symptom survived for weeks with no evidence pointing at a cause.
+ */
+function decisionLog(msg: string): void {
+  appendLog(msg);
+}
+
+function appendLog(msg: string): void {
+  try {
+    ensureTimersDir();
+    if (fs.existsSync(CRON_BG_LOG_PATH) && fs.statSync(CRON_BG_LOG_PATH).size > LOG_MAX_BYTES) {
+      const kept = fs.readFileSync(CRON_BG_LOG_PATH, 'utf-8').split('\n').slice(-LOG_KEEP_LINES);
+      fs.writeFileSync(CRON_BG_LOG_PATH, kept.join('\n'));
+    }
+    fs.appendFileSync(CRON_BG_LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch { /* diagnostics must never break the extension */ }
 }
 
 function readSharedTimers(): Map<string, SharedTimerEntry> {
@@ -109,6 +192,15 @@ function readRecurringJobs(): Map<string, RecurringJob> {
   const map = new Map<string, RecurringJob>();
   if (!fs.existsSync(RECURRING_JOBS_FILE)) return map;
   try {
+    // The widget loop calls this every second, and the file is shared by every
+    // Pi session (579 KB / 507 jobs on this machine): re-reading and re-parsing
+    // it each tick was ~1.8 ms of CPU plus the whole file read, per second, per
+    // session. The parsed map is cached on mtime+size, the same trick pi-arc
+    // uses for its archive listing. Mutations go through writeRecurringJobs,
+    // which invalidates the cache, so a local change is never missed.
+    const st = fs.statSync(RECURRING_JOBS_FILE);
+    const stamp = `${st.mtimeMs}:${st.size}`;
+    if (jobsCache && jobsCache.stamp === stamp) return jobsCache.map;
     const raw = fs.readFileSync(RECURRING_JOBS_FILE, 'utf-8');
     const data = JSON.parse(raw);
     if (Array.isArray(data)) {
@@ -118,12 +210,59 @@ function readRecurringJobs(): Map<string, RecurringJob> {
         }
       }
     }
+    jobsCache = { stamp, map };
   } catch {}
   return map;
 }
 
+let jobsCache: { stamp: string; map: Map<string, RecurringJob> } | null = null;
+
 function writeRecurringJobs(map: Map<string, RecurringJob>) {
   writeJsonAtomic(RECURRING_JOBS_FILE, Array.from(map.values()));
+  // The write changed the file: drop the cache so the next read re-parses.
+  jobsCache = null;
+}
+
+/** Is a process still running? Signal 0 performs the permission check only. */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/**
+ * Drops one-shot timers that can no longer fire, for two reasons:
+ *  - the deadline is past (plus a grace), or
+ *  - the process that owned the timer is gone: the `sleep` child died with the
+ *    session, so nothing will ever complete it, and its terminal event — the
+ *    only thing that removes a timer — will never arrive.
+ *
+ * This is STATE HYGIENE, not painting, so it must run regardless of the UI. It
+ * used to live inside `updateTuiWidget`, AFTER the `if (!currentCtx ||
+ * !currentCtx.hasUI) return;` guard: without a UI it never ran at all, and the
+ * file kept a timer from the previous day (measured: mtime frozen 10 hours back,
+ * with a timer expired the afternoon before still inside).
+ * Returns how many entries were removed.
+ */
+function cleanupTimers(): number {
+  // RAW read on purpose: `readSharedTimers` already filters out the expired
+  // entries, so they never reach a caller and could never be deleted — which is
+  // why the file kept them forever. Only here do we see what is really on disk.
+  ensureTimersDir();
+  let raw: unknown;
+  try { raw = JSON.parse(fs.readFileSync(SHARED_TIMERS_FILE, 'utf-8')); } catch { return 0; }
+  if (!Array.isArray(raw)) return 0;
+  const now = Date.now();
+  const kept = new Map<string, SharedTimerEntry>();
+  let dropped = 0;
+  for (const item of raw as SharedTimerEntry[]) {
+    if (!item || !item.id) { dropped += 1; continue; }
+    const expired = now >= item.targetTimestamp + TIMER_GRACE_MS;
+    const ownerGone = item.sessionPid !== process.pid && !isPidAlive(item.sessionPid);
+    if (expired || ownerGone) { dropped += 1; continue; }
+    kept.set(item.id, item);
+  }
+  if (dropped > 0) writeSharedTimers(kept);
+  return dropped;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +385,7 @@ function primaryOf(tag: string): string | null {
   return m ? m[1].toLowerCase() : null;
 }
 
-function isSupported(primary: string): primary is Lang {
+function isSupported(primary: string | null): primary is Lang {
   return primary === 'en' || primary === 'it';
 }
 
@@ -321,25 +460,42 @@ const I18N = {
 
 /** Localised string for the active language. */
 function t<K extends keyof (typeof I18N)['en']>(key: K): (typeof I18N)['en'][K] {
-  return I18N[LANG][key];
+  // The two catalogs are structurally identical by construction (both are
+  // `satisfies`-checked against the same shape), so the index is safe; the
+  // union of the two members is what the caller can rely on.
+  return (I18N[LANG] as (typeof I18N)['en'])[key];
 }
 
+/**
+ * Parses a duration into seconds.
+ *
+ * Accepts a bare number of seconds and composite unit forms ("90s", "10m",
+ * "1h", "2d", "1h30m").
+ *
+ * The old implementation matched only a single `s|m|h` group and, on any other
+ * input, fell back to `parseInt`, which reads the leading digits and returns
+ * them AS SECONDS: "2d" became 2 seconds, "1h30m" became 1 second and
+ * "10 minutes" became 10 seconds. A wakeup scheduled that way fires almost
+ * immediately, and nothing in the output says the duration was not understood.
+ * Unrecognised input is now rejected instead of silently truncated.
+ */
 function parseDurationToSeconds(duration: string): number {
-  const match = duration.trim().match(/^(\d+)\s*(s|m|h)?$/i);
-  if (!match) {
-    const parsed = parseInt(duration, 10);
-    if (!isNaN(parsed) && parsed > 0) return parsed;
-    throw new Error(`Invalid duration: "${duration}". Use formats like "10m", "600s", "1h" or a number of seconds.`);
-  }
-  const value = parseInt(match[1], 10);
-  const unit = (match[2] || 's').toLowerCase();
+  const raw = duration.trim().toLowerCase();
+  const UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+
   let seconds: number;
-  switch (unit) {
-    case 'h': seconds = value * 3600; break;
-    case 'm': seconds = value * 60; break;
-    case 's':
-    default: seconds = value;
+  const parts = raw.match(/\d+[smhd]/g);
+  if (parts && parts.join('') === raw) {
+    // Composite form: every character is accounted for by a <n><unit> part.
+    seconds = parts.reduce((sum, p) => sum + parseInt(p, 10) * UNIT_SECONDS[p.slice(-1)], 0);
+  } else if (/^\d+$/.test(raw)) {
+    seconds = parseInt(raw, 10);
+  } else {
+    throw new Error(
+      `Invalid duration: "${duration}". Use formats like "10m", "600s", "1h", "2d" or a number of seconds.`,
+    );
   }
+
   if (seconds < MIN_DURATION_SECONDS) {
     throw new Error(`Minimum allowed duration: ${MIN_DURATION_SECONDS}s. You specified ${seconds}s.`);
   }
@@ -389,6 +545,8 @@ export default function (pi: ExtensionAPI) {
   let disposed = false;
   /** Runtime generation: incremented on every session (re)start. */
   let generation = 0;
+  /** True once the widget has been cleared, so showWidget:false is idempotent. */
+  let widgetCleared = false;
   const pendingTimeouts = new Set<NodeJS.Timeout>();
 
   function clearPendingTimeouts() {
@@ -463,17 +621,27 @@ export default function (pi: ExtensionAPI) {
   function updateTuiWidget() {
     if (disposed) return;
     if (!currentCtx || !currentCtx.hasUI) return;
+    const cfg = loadConfig();
+    // The widget is the only visible surface of this extension: with
+    // showWidget:false the extension still schedules and wakes, it just stops
+    // painting. The previous widget is cleared once so a config change takes
+    // effect immediately instead of at the next process start.
+    if (!cfg.showWidget) {
+      if (widgetCleared) return;
+      widgetCleared = true;
+      try {
+        currentCtx.ui.setWidget('pi-cron-bg', undefined);
+        currentCtx.ui.setStatus('pi-cron-bg', undefined);
+      } catch { /* stale runtime: the loop below disarms on its own */ }
+      return;
+    }
+    if (widgetCleared) {
+      widgetCleared = false;
+      startUpdateLoop();
+    }
     try {
       const now = Date.now();
       const map = readSharedTimers();
-      let cleaned = false;
-      for (const [id, timer] of map.entries()) {
-        if (now >= timer.targetTimestamp + 2000) {
-          map.delete(id);
-          cleaned = true;
-        }
-      }
-      if (cleaned) writeSharedTimers(map);
 
       const sessionTimers: SharedTimerEntry[] = [];
       for (const timer of map.values()) {
@@ -516,6 +684,7 @@ export default function (pi: ExtensionAPI) {
       const widgetLine = theme.fg('accent', '● ACTIVE TIMERS: ') + theme.fg('warning', parts.join('  '));
       currentCtx.ui.setWidget('pi-cron-bg', [widgetLine]);
       currentCtx.ui.setStatus('pi-cron-bg', theme.fg('accent', parts.join(' | ')));
+      debugLog(cfg, `widget: ${sessionTimers.length} timer(s), ${activeRecurring.length} job(s)`);
     } catch {
       // If the runtime really is stale (reload/replacement) disarm; a transient
       // error must not kill the rendering loop.
@@ -529,8 +698,12 @@ export default function (pi: ExtensionAPI) {
       const gen = generation;
       updateInterval = setInterval(() => {
         if (disposed || gen !== generation) return;
+        // Hygiene FIRST, and outside any UI guard: a stale timer must leave the
+        // file even when there is no widget to paint.
+        cleanupTimers();
         updateTuiWidget();
       }, 1000);
+      cleanupTimers();
       updateTuiWidget();
     }
   }
@@ -624,7 +797,10 @@ export default function (pi: ExtensionAPI) {
 
     Promise.race([
       startPromise,
-      new Promise<{ ok: boolean; error: string }>((_, reject) =>
+      // Same shape as startPromise: the timeout branch only rejects, but its type
+      // still joins the union, and without `result` the .then() below cannot
+      // read outcome.result (TS2339).
+      new Promise<{ ok: boolean; result?: any; error?: string }>((_, reject) =>
         trackTimeout(() => reject(new Error('Timeout avvio job ricorrente')), 5000)
       ),
     ])
@@ -663,12 +839,13 @@ export default function (pi: ExtensionAPI) {
       })
       .catch(() => {
         if (disposed || gen !== generation) return;
-        const jobs = readRecurringJobs();
-        const current = jobs.get(job.id);
-        if (!current) return;
-        current.scheduledTaskId = null;
-        jobs.set(current.id, current);
-        writeRecurringJobs(jobs);
+        // Under the cross-process lock, like every other write-back.
+        mutateJobs((jobs) => {
+          const current = jobs.get(job.id);
+          if (!current) return;
+          current.scheduledTaskId = null;
+          jobs.set(current.id, current);
+        });
       });
   }
 
@@ -702,7 +879,16 @@ export default function (pi: ExtensionAPI) {
       }
       return { changed: false, rearm: false, job: null };
     });
-    if (outcome.rearm && outcome.job) scheduleRecurringJob(outcome.job);
+    if (outcome.rearm && outcome.job) {
+      scheduleRecurringJob(outcome.job);
+      // The hot path used to be SILENT: the log spoke only at session_start, so
+      // a healthy chain (fired -> re-armed) left no trace and an unhealthy one
+      // was indistinguishable from a job that had simply not come due yet.
+      decisionLog(
+        `recurring job fired (${status}): ${outcome.job.label}` +
+        ` -> next in ${formatRemaining(Math.max(0, Math.round((outcome.job.nextRunAt - Date.now()) / 1000)))}`,
+      );
+    }
     if (outcome.changed) updateTuiWidget();
 
     // One-shot timers: remove from the widget
@@ -748,29 +934,118 @@ export default function (pi: ExtensionAPI) {
     currentCtx = ctx;
     currentSessionId = readCurrentSessionId(ctx);
     clearPendingTimeouts();
+    // F7: the config was documented but never read. Loading it here makes
+    // showWidget and debug effective for this session, and a reload picks up a
+    // changed file without a restart.
+    const bootCfg = loadConfig();
+    debugLog(bootCfg, `session_start reason=${(event as any)?.reason ?? 'unknown'} showWidget=${bootCfg.showWidget}`);
+    // Timers whose process is gone, or whose deadline has passed, are dropped
+    // here: at startup we know no task of a previous process can still fire.
+    const droppedTimers = cleanupTimers();
+    if (droppedTimers > 0) decisionLog(`session_start: dropped ${droppedTimers} dead timer(s)`);
     startUpdateLoop();
 
     const reason = (event as any)?.reason as string | undefined;
     const freshSession = reason === 'new' || reason === 'fork';
 
-    if (!freshSession) {
-      const jobs = readRecurringJobs();
-      let changed = false;
-      for (const job of jobs.values()) {
-        if (!job.active) continue;
-        // Tight anchoring: re-arms ONLY this session's jobs.
-        // A job from another session (or without an owner) is never touched.
-        if (!currentSessionId || job.ownerSessionId !== currentSessionId) continue;
-        if (job.nextRunAt <= Date.now()) {
-          job.nextRunAt = Date.now() + job.intervalSeconds * 1000;
-          changed = true;
+    // ADOPTION PASS — runs on EVERY session_start, `/new` and `/fork` included,
+    // because those are exactly the cases that leave jobs behind. A job whose
+    // owning PROCESS is gone has no heartbeat left to protect: its session
+    // ended and nobody will ever re-arm it, since the terminal event that would
+    // have done so travels on an in-process EventBus and died with that
+    // process. Such a job is adopted by whichever session finds it — same job,
+    // new owner and pid — so it resumes instead of staying `active: true`
+    // forever against a stale task id. A job of a session that is still ALIVE
+    // is never touched: that is the protection the tight anchoring exists for.
+    // `ownerPid` absent means the file predates this field. The pid cannot
+    // answer, so fall back to the only other evidence the job carries: a live
+    // owner re-arms its jobs, therefore a job already past its own interval
+    // that has NEVER fired cannot belong to a session that is still maintaining
+    // it. Such a job is an orphan whose owner died before the first run.
+    // Measured on the real file: two such jobs, 23h old, nextRunAt 17h in the
+    // past, lastRunAt null — while the two live jobs of the current session
+    // were one minute old and were correctly left untouched.
+    if (currentSessionId) {
+      const adozione = mutateJobs((jobs) => {
+        const toSchedule: RecurringJob[] = [];
+        const adopted: string[] = [];
+        const now = Date.now();
+        for (const job of jobs.values()) {
+          if (!job.active) continue;
+          if (job.ownerSessionId === currentSessionId) continue;
+          if (typeof job.ownerPid === 'number') {
+            // Owner pid known: adopt only if that process is gone.
+            if (isPidAlive(job.ownerPid)) continue;
+          } else {
+            // Legacy job: adopt only when it is overdue AND never ran.
+            const overdue = now - job.createdAt > job.intervalSeconds * 1000;
+            if (!overdue || job.lastRunAt !== null) continue;
+          }
+          job.ownerSessionId = currentSessionId;
+          job.ownerPid = process.pid;
+          job.scheduledTaskId = null;
+          if (job.nextRunAt <= Date.now()) {
+            // Same rule as the re-arm below: skip the occurrences already
+            // missed instead of replaying them one per completion.
+            job.nextRunAt = Date.now() + job.intervalSeconds * 1000;
+          }
+          jobs.set(job.id, job);
+          toSchedule.push(job);
+          adopted.push(job.label);
         }
-        if (!job.scheduledTaskId) {
-          changed = true;
-          scheduleRecurringJob(job);
-        }
+        return { toSchedule, adopted };
+      });
+      for (const job of adozione.toSchedule) scheduleRecurringJob(job);
+      if (adozione.toSchedule.length > 0) {
+        decisionLog(
+          `session_start: adopted ${adozione.toSchedule.length} job(s) whose owner is gone` +
+          ` (${adozione.adopted.join(', ')}) -> now owned by session ${currentSessionId}`,
+        );
       }
-      if (changed) writeRecurringJobs(jobs);
+    }
+
+    if (!freshSession) {
+      // Read-modify-write under the cross-process lock, so a concurrent session's
+      // write is not clobbered. The jobs to (re)schedule are collected here and
+      // scheduled AFTER the lock is released: scheduling must not hold it.
+      const riarmo = mutateJobs((jobs) => {
+        const toSchedule: RecurringJob[] = [];
+        const staleIdsDropped: string[] = [];
+        for (const job of jobs.values()) {
+          if (!job.active) continue;
+          // Tight anchoring: re-arms ONLY this session's jobs.
+          // A job from another session (or without an owner) is never touched.
+          if (!currentSessionId || job.ownerSessionId !== currentSessionId) continue;
+          // A FRESH PROCESS has no live task for ANY of its jobs: the terminal
+          // event that would have re-armed them is delivered on an in-process
+          // EventBus and therefore died with the previous process (restart,
+          // suspend, reload). So the id is stale for EVERY job, not only for the
+          // overdue ones — dropping it only when the deadline was already past
+          // is what made a job with time still on the clock skip an occurrence at
+          // every restart: it only fired at the NEXT restart, i.e. late.
+          const staleId = job.scheduledTaskId;
+          job.scheduledTaskId = null;
+          if (job.nextRunAt <= Date.now()) {
+            // Skip the occurrences already missed instead of replaying them: a
+            // bare `nextRunAt + interval` walks one slot per completion, so an
+            // 8h-old 5-minute heartbeat would spawn 96 immediate tasks.
+            job.nextRunAt = Date.now() + job.intervalSeconds * 1000;
+          }
+          jobs.set(job.id, job);
+          toSchedule.push(job);
+          if (staleId) staleIdsDropped.push(job.id);
+        }
+        return { toSchedule, staleIdsDropped };
+      });
+      for (const job of riarmo.toSchedule) scheduleRecurringJob(job);
+      if (riarmo.toSchedule.length > 0 || riarmo.staleIdsDropped.length > 0) {
+        decisionLog(
+          `session_start: re-armed ${riarmo.toSchedule.length} job(s) of session ${currentSessionId}` +
+          (riarmo.staleIdsDropped.length > 0
+            ? `, dropped ${riarmo.staleIdsDropped.length} stale task id(s) (${riarmo.staleIdsDropped.join(', ')})`
+            : ''),
+        );
+      }
     }
 
     updateTuiWidget();
@@ -897,7 +1172,10 @@ export default function (pi: ExtensionAPI) {
 
         const outcome = await Promise.race([
           startPromise,
-          new Promise<{ ok: boolean; error: string }>((_, reject) =>
+          // The timeout branch only rejects, but its type still joins the union
+          // returned by Promise.race. Give it the same shape as startPromise so
+          // the resolved value always carries `result`.
+          new Promise<{ ok: boolean; result?: any; error?: string }>((_, reject) =>
             setTimeout(() => reject(new Error(t('bgConfirmTimeout'))), 5000)
           ),
         ]);
@@ -1048,6 +1326,7 @@ export default function (pi: ExtensionAPI) {
           lastRunAt: null,
           scheduledTaskId: null,
           ownerSessionId: currentSessionId,
+          ownerPid: process.pid,
         };
         // Under the cross-process lock so a concurrent session's job is not
         // clobbered by this write-back.
@@ -1068,7 +1347,23 @@ export default function (pi: ExtensionAPI) {
         const pruned = mutateJobs((allJobs) => {
           let n = 0;
           for (const [id, job] of allJobs) {
-            if (!jobIsOurs(job)) {
+            // Only jobs that cannot be running: stopped ones, and orphans with no
+            // owner. `jobIsOurs` alone also matches the jobs of ANOTHER Pi
+            // session that is still alive, so pruning used to kill a running
+            // session's heartbeats with no warning — which is why nobody dared
+            // prune, and the file grew without bound (507 jobs / 579 KB here,
+            // 492 of them inactive).
+            // Only jobs that cannot be running: stopped ones, orphans with no
+            // owner, and jobs whose owning PROCESS is gone. `jobIsOurs` alone
+            // also matches the jobs of ANOTHER Pi session that is still alive,
+            // so pruning used to kill a running session's heartbeats with no
+            // warning — which is why nobody dared prune, and the file grew
+            // without bound (507 jobs / 579 KB here, 492 of them inactive).
+            // `ownerPid` is what makes the distinction possible: a live owner
+            // keeps its job, a dead one does not. Jobs adopted at session_start
+            // carry the current pid, so a healthy job is never at risk here.
+            if (!job.active || !job.ownerSessionId ||
+                (typeof job.ownerPid === 'number' && !isPidAlive(job.ownerPid))) {
               allJobs.delete(id);
               // NOTE: no timeout cleanup here. `scheduledTaskId` holds a
               // pi-background-tasks task id (a string), whereas `pendingTimeouts`
@@ -1083,7 +1378,7 @@ export default function (pi: ExtensionAPI) {
         updateTuiWidget();
         return {
           content: [{ type: 'text', text: pruned > 0
-            ? `Pruned ${pruned} jobs not belonging to this session.`
+            ? `Pruned ${pruned} stopped/orphan jobs (live jobs of other sessions are kept).`
             : 'No orphan job to remove.' }],
           details: { ok: true, pruned },
         };
@@ -1121,10 +1416,12 @@ export default function (pi: ExtensionAPI) {
         lastRunAt: null,
         scheduledTaskId: null,
         ownerSessionId: currentSessionId,
+        ownerPid: process.pid,
       };
-      const jobs = readRecurringJobs();
-      jobs.set(job.id, job);
-      writeRecurringJobs(jobs);
+      // Under the cross-process lock (mutateJobs), like every other
+      // read-modify-write: a plain read/write pair here could clobber a job that
+      // another session wrote between the two calls, contradicting the README.
+      mutateJobs((jobs) => { jobs.set(job.id, job); });
       scheduleRecurringJob(job);
       ctx.ui.notify(`Recurring job started: ${label} (${jobId}) every ${formatRemaining(seconds)}`, 'info');
     },
@@ -1161,18 +1458,28 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify('Error: a job id is required.', 'error');
         return;
       }
-      const jobs = readRecurringJobs();
-      const job = jobs.get(jobId);
-      if (!job) {
+      // Under the cross-process lock, like the tool path. The ownership check is
+      // repeated inside the lock so a job that changed owner between the read and
+      // the write is not stopped by the wrong session.
+      const outcome = mutateJobs((jobs) => {
+        const job = jobs.get(jobId);
+        if (!job) return { found: false as const };
+        if (!jobIsOurs(job)) return { found: true as const, notOwner: true as const };
+        job.active = false;
+        job.scheduledTaskId = null;
+        jobs.set(job.id, job);
+        return { found: true as const, notOwner: false as const, label: job.label };
+      });
+      if (!outcome.found) {
         ctx.ui.notify(`Job ${jobId} not found.`, 'error');
         return;
       }
-      job.active = false;
-      job.scheduledTaskId = null;
-      jobs.set(job.id, job);
-      writeRecurringJobs(jobs);
+      if (outcome.notOwner) {
+        ctx.ui.notify(`Job ${jobId} belongs to another session.`, 'error');
+        return;
+      }
       updateTuiWidget();
-      ctx.ui.notify(`Recurring job stopped: ${job.label} (${job.id}).`, 'info');
+      ctx.ui.notify(`Recurring job stopped: ${outcome.label} (${jobId}).`, 'info');
     },
   });
 }
