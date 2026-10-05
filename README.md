@@ -28,7 +28,7 @@ Two tools, no polling loop and no idle tokens:
 | `list`  | Lists **this session's** jobs, and reports how many belong to others. |
 | `prune` | Removes jobs not belonging to this session. |
 
-Slash equivalents: `/cron-repeat`, `/cron-repeat-list`, `/cron-repeat-stop`.
+Slash equivalents: `/cron-repeat`, `/cron-repeat-list`, `/cron-repeat-stop`, `/cron-repeat-prune`.
 
 ### Design notes
 
@@ -63,7 +63,7 @@ State lives in `~/.pi/timers/`.
 ### Testing
 
 ```bash
-node harness.mjs   # 11/11: start → schedule → terminal event → re-arm → stop
+node harness.mjs   # 29/29: start → schedule → terminal event → re-arm → stop → isolation → prune
 ```
 
 ---
@@ -93,7 +93,7 @@ Due tool, nessun polling e nessun token consumato durante l'attesa:
 | `list`  | Elenca i job **di questa sessione** e riporta quanti sono altrui. |
 | `prune` | Rimuove i job che non appartengono a questa sessione. |
 
-Equivalenti slash: `/cron-repeat`, `/cron-repeat-list`, `/cron-repeat-stop`.
+Equivalenti slash: `/cron-repeat`, `/cron-repeat-list`, `/cron-repeat-stop`, `/cron-repeat-prune`.
 
 ### Note di progetto
 
@@ -129,7 +129,7 @@ Lo stato risiede in `~/.pi/timers/`.
 ### Test
 
 ```bash
-node harness.mjs   # 11/11: start → schedule → evento terminale → riarmo → stop
+node harness.mjs   # 29/29: start → schedule → evento terminale → riarmo → stop → isolamento → prune
 ```
 
 ---

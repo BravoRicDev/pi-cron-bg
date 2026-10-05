@@ -225,12 +225,11 @@ check(
   logText.split('\n').filter(Boolean).slice(-1)[0] ?? '',
 );
 
-// ---- 14. ADOZIONE DEI JOB ORFANI: la sessione id da sola non basta ----
-// `ownerSessionId` e' stabile attraverso /resume ma NUOVO su /new e /fork, e il
-// job non portava il pid del processo proprietario: un job `active: true` di una
-// sessione MORTA era indistinguibile da uno di una sessione VIVA, quindi nessuno
-// lo riarmava (restava armato contro un task id morto col processo) e nessuno lo
-// toglieva (il prune cancellava solo `!job.active || !job.ownerSessionId`).
+// ---- 14. ISOLAMENTO E PULIZIA ORFANI: nessuna adozione cross-sessione ----
+// Un job appartiene SOLO alla sessione che lo ha creato. Una sessione diversa
+// o un avvio con /new NON deve MAI adottare job altrui.
+// Gli orfani con pid morto o senza sessione vengono disattivati e prunati
+// all'avvio per mantenere pulito il file di stato.
 const jobFile3 = path.join(fakeHome, '.pi', 'timers', 'recurring-jobs.json');
 const deadPidJob = {
   id: 'dead-owner', label: 'DEAD-OWNER', intervalSeconds: 3600, wakePrompt: 'x',
@@ -250,64 +249,70 @@ const noPidJob = {
   lastRunAt: null, scheduledTaskId: null,
   ownerSessionId: 'a-live-session',
 };
-// Legacy job that IS overdue and has NEVER fired: the only other evidence a job
-// without `ownerPid` carries. 23h old against a 1h interval, so a live owner
-// would certainly have run it — which is what makes it adoptable.
+// Legacy orphan job without owner
 const legacyOverdueJob = {
   id: 'legacy-overdue', label: 'LEGACY-OVERDUE', intervalSeconds: 3600, wakePrompt: 'x',
   active: true, nextRunAt: Date.now() - 60_000, createdAt: Date.now() - 23 * 3600_000,
   lastRunAt: null, scheduledTaskId: 'task-of-a-dead-legacy',
-  ownerSessionId: 'a-dead-legacy-session',
+  ownerSessionId: '',
 };
 fs.writeFileSync(jobFile3, JSON.stringify([deadPidJob, livePidJob, noPidJob, legacyOverdueJob]));
 const beforeAdopt = scheduledTasks.length;
-// `new` e non `resume`: e' il caso che genera gli orfani, ed e' quello che
-// l'adozione deve coprire (su resume la sessione combacia gia' per id).
+// `new`: avvio pulito, non deve adottare NESSUN job orfano
 await lifecycle.session_start({ reason: 'new' }, ctx);
 await new Promise((r) => setTimeout(r, 300));
 check(
-  'ADOZIONE: un job col pid morto viene riarmato anche su /new',
-  scheduledTasks.length === beforeAdopt + 2,
-  `scheduled=${scheduledTasks.length} (atteso ${beforeAdopt + 2})`,
+  'ISOLAMENTO: nessun job orfano viene adottato o rischedulato su /new',
+  scheduledTasks.length === beforeAdopt,
+  `scheduled=${scheduledTasks.length} (atteso ${beforeAdopt})`,
 );
 let afterAdopt = [];
 try { afterAdopt = JSON.parse(fs.readFileSync(jobFile3, 'utf-8')); } catch { afterAdopt = []; }
 const byId = (id) => afterAdopt.find((j) => j.id === id);
 check(
-  'ADOZIONE: il job adottato passa alla sessione corrente e a questo processo',
-  byId('dead-owner')?.ownerSessionId === 'harness-session' && byId('dead-owner')?.ownerPid === process.pid,
-  `owner=${byId('dead-owner')?.ownerSessionId} pid=${byId('dead-owner')?.ownerPid}`,
+  'PULIZIA: il job col pid morto viene rimosso (prunato)',
+  byId('dead-owner') === undefined,
+  `dead-owner=${byId('dead-owner')?.id}`,
 );
 check(
-  'ADOZIONE: l\'id stantio del job adottato e\' stato scartato',
-  byId('dead-owner')?.scheduledTaskId !== 'task-of-a-dead-process',
-  `scheduledTaskId=${byId('dead-owner')?.scheduledTaskId}`,
+  'PULIZIA: il job orfano legacy viene rimosso',
+  byId('legacy-overdue') === undefined,
+  `legacy-overdue=${byId('legacy-overdue')?.id}`,
 );
 check(
-  'ADOZIONE: il deadline scaduto viene spostato in avanti, non rigiocato',
-  (byId('dead-owner')?.nextRunAt ?? 0) > Date.now(),
-  `nextRunAt=${byId('dead-owner')?.nextRunAt}`,
-);
-check(
-  'ADOZIONE: il job di una sessione VIVA non viene toccato',
+  'PROTEZIONE: il job di una sessione VIVA non viene toccato',
   byId('live-owner')?.ownerSessionId === 'a-live-session' && byId('live-owner')?.ownerPid === process.pid,
   `owner=${byId('live-owner')?.ownerSessionId}`,
 );
 check(
-  'ADOZIONE: un job senza ownerPid (file vecchio) non viene adottato',
+  'PROTEZIONE: il job di una sessione altrui senza pid non viene toccato se ha ownerSessionId',
   byId('legacy-no-pid')?.ownerSessionId === 'a-live-session',
   `owner=${byId('legacy-no-pid')?.ownerSessionId}`,
 );
+
+// ---- 14b. RESUME: la sessione riarma SOLO i PROPRI job ----
+const ownResumeJob = {
+  id: 'own-resume-job', label: 'OWN-JOB', intervalSeconds: 1800, wakePrompt: 'wake',
+  active: true, nextRunAt: Date.now() - 1000, createdAt: Date.now() - 2000,
+  lastRunAt: null, scheduledTaskId: 'stale-task',
+  ownerSessionId: 'harness-session', ownerPid: 888_888,
+};
+fs.writeFileSync(jobFile3, JSON.stringify([ownResumeJob, livePidJob]));
+const beforeResume = scheduledTasks.length;
+await lifecycle.session_start({ reason: 'resume' }, ctx);
+await new Promise((r) => setTimeout(r, 300));
 check(
-  'ADOZIONE: un job legacy SCADUTO e mai eseguito viene adottato',
-  byId('legacy-overdue')?.ownerSessionId === 'harness-session' &&
-    byId('legacy-overdue')?.ownerPid === process.pid,
-  `owner=${byId('legacy-overdue')?.ownerSessionId} pid=${byId('legacy-overdue')?.ownerPid}`,
+  'RESUME: la sessione riarma il proprio job su resume',
+  scheduledTasks.length === beforeResume + 1,
+  `scheduled=${scheduledTasks.length} (atteso ${beforeResume + 1})`,
 );
+let afterResume = [];
+try { afterResume = JSON.parse(fs.readFileSync(jobFile3, 'utf-8')); } catch { afterResume = []; }
+const ownJobAfter = afterResume.find((j) => j.id === 'own-resume-job');
 check(
-  'ADOZIONE: il deadline scaduto del job legacy viene spostato in avanti',
-  (byId('legacy-overdue')?.nextRunAt ?? 0) > Date.now(),
-  `nextRunAt=${byId('legacy-overdue')?.nextRunAt}`,
+  'RESUME: il pid del proprio job viene aggiornato al processo corrente',
+  ownJobAfter?.ownerPid === process.pid,
+  `pid=${ownJobAfter?.ownerPid} atteso=${process.pid}`,
 );
 
 // ---- 15. PRUNE: anche un pid morto rende un job rimovibile ----
@@ -320,6 +325,32 @@ check(
   'PRUNE: il job col pid morto sparisce, quello col pid vivo resta',
   afterPrune.length === 1 && afterPrune[0]?.id === 'live-owner',
   `rimasti=${afterPrune.map((j) => j.id).join(',')}`,
+);
+
+// ---- 16. SLASH COMMAND: /cron-repeat-prune ----
+check('comando /cron-repeat-prune registrato', typeof commands['cron-repeat-prune']?.handler === 'function');
+fs.writeFileSync(jobFile3, JSON.stringify([deadPidJob, livePidJob]));
+await commands['cron-repeat-prune'].handler('', ctx);
+let afterSlashPrune = [];
+try { afterSlashPrune = JSON.parse(fs.readFileSync(jobFile3, 'utf-8')); } catch { afterSlashPrune = []; }
+check(
+  'COMMAND /cron-repeat-prune: rimuove il job morto e preserva quello vivo',
+  afterSlashPrune.length === 1 && afterSlashPrune[0]?.id === 'live-owner',
+  `rimasti=${afterSlashPrune.map((j) => j.id).join(',')}`,
+);
+
+// ---- 17. SLASH COMMAND: /cron-repeat-list filtri di sessione ----
+check('comando /cron-repeat-list registrato', typeof commands['cron-repeat-list']?.handler === 'function');
+let lastNotify = '';
+const notifyCtx = {
+  ...ctx,
+  ui: { ...ctx.ui, notify: (msg) => { lastNotify = msg; } },
+};
+await commands['cron-repeat-list'].handler('', notifyCtx);
+check(
+  'COMMAND /cron-repeat-list: non mostra i job di altre sessioni (live-owner nascosto)',
+  !lastNotify.includes('LIVE-OWNER') && (lastNotify.includes('hidden') || lastNotify.includes('Nessun') || lastNotify.includes('No')),
+  lastNotify,
 );
 
 const failed = results.filter((r) => !r.ok);

@@ -921,11 +921,11 @@ export default function (pi: ExtensionAPI) {
   subscribeStatusChannel();
 
   // Store the context and start the rendering loop.
-  // Ownership: recurring jobs belong to ONE session (SessionHeader.id).
+  // Ownership: recurring jobs belong strictly to ONE session (SessionHeader.id).
   //  - startup / resume / reload -> re-arms ONLY this session's jobs
-  //    (legacy orphans without an owner get adopted and marked)
-  //  - new / fork                -> starts CLEAN: adopts no existing job
-  pi.on('session_start', async (event, ctx) => {
+  //  - new / fork                -> starts CLEAN: zero jobs re-armed or adopted
+  //  - dead orphans              -> pruned/deactivated; never adopted cross-session
+  pi.on('session_start', (event, ctx) => {
     disposed = false;
     // New generation: invalidates timers/retries captured by the previous one.
     generation += 1;
@@ -948,63 +948,46 @@ export default function (pi: ExtensionAPI) {
     const reason = (event as any)?.reason as string | undefined;
     const freshSession = reason === 'new' || reason === 'fork';
 
-    // ADOPTION PASS — runs on EVERY session_start, `/new` and `/fork` included,
-    // because those are exactly the cases that leave jobs behind. A job whose
-    // owning PROCESS is gone has no heartbeat left to protect: its session
-    // ended and nobody will ever re-arm it, since the terminal event that would
-    // have done so travels on an in-process EventBus and died with that
-    // process. Such a job is adopted by whichever session finds it — same job,
-    // new owner and pid — so it resumes instead of staying `active: true`
-    // forever against a stale task id. A job of a session that is still ALIVE
-    // is never touched: that is the protection the tight anchoring exists for.
-    // `ownerPid` absent means the file predates this field. The pid cannot
-    // answer, so fall back to the only other evidence the job carries: a live
-    // owner re-arms its jobs, therefore a job already past its own interval
-    // that has NEVER fired cannot belong to a session that is still maintaining
-    // it. Such a job is an orphan whose owner died before the first run.
-    // Measured on the real file: two such jobs, 23h old, nextRunAt 17h in the
-    // past, lastRunAt null — while the two live jobs of the current session
-    // were one minute old and were correctly left untouched.
-    if (currentSessionId) {
-      const adozione = mutateJobs((jobs) => {
-        const toSchedule: RecurringJob[] = [];
-        const adopted: string[] = [];
-        const now = Date.now();
-        for (const job of jobs.values()) {
-          if (!job.active) continue;
-          if (job.ownerSessionId === currentSessionId) continue;
-          if (typeof job.ownerPid === 'number') {
-            // Owner pid known: adopt only if that process is gone.
-            if (isPidAlive(job.ownerPid)) continue;
-          } else {
-            // Legacy job: adopt only when it is overdue AND never ran.
-            const overdue = now - job.createdAt > job.intervalSeconds * 1000;
-            if (!overdue || job.lastRunAt !== null) continue;
+    // ORPHAN CLEANUP & DEACTIVATION PASS
+    // Jobs belong strictly to the session that created them. A session never
+    // adopts or re-arms jobs from other sessions.
+    // When an owner process dies, its active jobs are deactivated so they do not
+    // linger in active state, and dead/inactive orphans are pruned to keep the
+    // shared file clean.
+    // Live jobs of concurrent running Pi sessions (isPidAlive is true) are
+    // strictly protected and left untouched.
+    const cleanup = mutateJobs((jobs) => {
+      const deactivated: string[] = [];
+      const pruned: string[] = [];
+      for (const [id, job] of jobs.entries()) {
+        // Never touch our own session's jobs here; they are handled in the re-arm pass below.
+        if (currentSessionId && job.ownerSessionId === currentSessionId) continue;
+
+        const isOwnerDead = typeof job.ownerPid === 'number'
+          ? !isPidAlive(job.ownerPid)
+          : !job.ownerSessionId; // legacy without owner
+
+        if (isOwnerDead) {
+          if (job.active) {
+            job.active = false;
+            job.scheduledTaskId = null;
+            job.disabledReason = 'owner_dead';
+            deactivated.push(job.label);
           }
-          job.ownerSessionId = currentSessionId;
-          job.ownerPid = process.pid;
-          job.scheduledTaskId = null;
-          if (job.nextRunAt <= Date.now()) {
-            // Same rule as the re-arm below: skip the occurrences already
-            // missed instead of replaying them one per completion.
-            job.nextRunAt = Date.now() + job.intervalSeconds * 1000;
-          }
-          jobs.set(job.id, job);
-          toSchedule.push(job);
-          adopted.push(job.label);
+          jobs.delete(id);
+          pruned.push(job.label);
         }
-        return { toSchedule, adopted };
-      });
-      for (const job of adozione.toSchedule) scheduleRecurringJob(job);
-      if (adozione.toSchedule.length > 0) {
-        decisionLog(
-          `session_start: adopted ${adozione.toSchedule.length} job(s) whose owner is gone` +
-          ` (${adozione.adopted.join(', ')}) -> now owned by session ${currentSessionId}`,
-        );
       }
+      return { deactivated, pruned };
+    });
+    if (cleanup.pruned.length > 0) {
+      decisionLog(
+        `session_start: pruned ${cleanup.pruned.length} dead orphan job(s) from terminated session(s)` +
+        ` (${cleanup.pruned.join(', ')})`,
+      );
     }
 
-    if (!freshSession) {
+    if (!freshSession && currentSessionId) {
       // Read-modify-write under the cross-process lock, so a concurrent session's
       // write is not clobbered. The jobs to (re)schedule are collected here and
       // scheduled AFTER the lock is released: scheduling must not hold it.
@@ -1015,7 +998,8 @@ export default function (pi: ExtensionAPI) {
           if (!job.active) continue;
           // Tight anchoring: re-arms ONLY this session's jobs.
           // A job from another session (or without an owner) is never touched.
-          if (!currentSessionId || job.ownerSessionId !== currentSessionId) continue;
+          if (job.ownerSessionId !== currentSessionId) continue;
+          job.ownerPid = process.pid;
           // A FRESH PROCESS has no live task for ANY of its jobs: the terminal
           // event that would have re-armed them is delivered on an in-process
           // EventBus and therefore died with the previous process (restart,
@@ -1432,7 +1416,11 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       currentCtx = ctx;
       currentSessionId = readCurrentSessionId(ctx) ?? currentSessionId;
-      const jobs = readRecurringJobs();
+      const allJobs = readRecurringJobs();
+      const jobs = new Map<string, RecurringJob>();
+      for (const [id, job] of allJobs) {
+        if (jobIsOurs(job)) jobs.set(id, job);
+      }
       const now = Date.now();
       const lines: string[] = [];
       if (jobs.size === 0) {
@@ -1441,10 +1429,40 @@ export default function (pi: ExtensionAPI) {
         lines.push(t('recurringJobsList'));
         for (const job of jobs.values()) {
           const remainingSec = Math.max(0, Math.round((job.nextRunAt - now) / 1000));
-          lines.push(`- ${job.id} | ${job.label} | every ${formatRemaining(job.intervalSeconds)} | next in ${formatRemaining(remainingSec)}`);
+          lines.push(`- ${job.id} | ${job.label} | every ${formatRemaining(job.intervalSeconds)} | next in ${formatRemaining(remainingSec)} | active=${job.active}`);
+        }
+        const hidden = allJobs.size - jobs.size;
+        if (hidden > 0) {
+          lines.push(`(${hidden} jobs from other sessions hidden — use /cron-repeat-prune to clean up)`);
         }
       }
       ctx.ui.notify(lines.join('\n'), 'info');
+    },
+  });
+
+  pi.registerCommand('cron-repeat-prune', {
+    description: 'Prunes stopped and orphaned recurring jobs.',
+    handler: async (_args, ctx) => {
+      currentCtx = ctx;
+      currentSessionId = readCurrentSessionId(ctx) ?? currentSessionId;
+      const pruned = mutateJobs((allJobs) => {
+        let n = 0;
+        for (const [id, job] of allJobs) {
+          if (!job.active || !job.ownerSessionId ||
+              (typeof job.ownerPid === 'number' && !isPidAlive(job.ownerPid))) {
+            allJobs.delete(id);
+            n++;
+          }
+        }
+        return n;
+      });
+      updateTuiWidget();
+      ctx.ui.notify(
+        pruned > 0
+          ? `Pruned ${pruned} stopped/orphan jobs.`
+          : 'No orphan job to remove.',
+        'info',
+      );
     },
   });
 
